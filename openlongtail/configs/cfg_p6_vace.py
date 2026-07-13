@@ -1,0 +1,9 @@
+from __future__ import annotations
+from dataclasses import replace
+from openlongtail.configs.cfg_p5_vace import P5_SHARED_NOISE_ALPHA, P5_SYNC_TEMPORAL_WINDOW, P5_VACE_CONFIG
+P6_VACE_CONFIG = replace(P5_VACE_CONFIG, run=replace(P5_VACE_CONFIG.run, train_log_name='train_log_p6.jsonl'))
+P6_ADJACENT_CONDITION_NOISE_PROB = 0.3
+P6_ADJACENT_CONDITION_NOISE_MIN = 0.02
+P6_ADJACENT_CONDITION_NOISE_MAX = 0.15
+P6_SHARED_NOISE_ALPHA = P5_SHARED_NOISE_ALPHA
+P6_SYNC_TEMPORAL_WINDOW = P5_SYNC_TEMPORAL_WINDOW

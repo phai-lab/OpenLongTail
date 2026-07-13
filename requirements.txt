@@ -1,0 +1,21 @@
+# OpenLongTail — core Python dependencies (Python 3.10, CUDA, bf16).
+# Pin exact versions to match your Wan2.1-VACE setup; the list below is the
+# minimal functional set. Install a CUDA-matched PyTorch build first, e.g.:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+torch>=2.1
+torchvision
+diffusers>=0.27
+transformers>=4.49          # Qwen2.5-VL captioning (dashcam path) needs >=4.49
+tokenizers
+accelerate
+safetensors
+huggingface_hub
+einops
+numpy
+opencv-python
+Pillow
+imageio
+imageio-ffmpeg
+ftfy
+regex
+tqdm

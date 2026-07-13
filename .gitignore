@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Model assets / caches / outputs (never commit weights or data)
+checkpoints/
+outputs/
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+.hf_cache/
+
+# Scratch / logs
+logs/
+*.log
+*.err
+*.out
+_*
+!**/__init__.py
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
