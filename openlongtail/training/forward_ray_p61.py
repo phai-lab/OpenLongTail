@@ -93,13 +93,19 @@ def _sample_condition_sigma(batch: int, slots: int, device: torch.device, dtype:
     sampled = noise_min + (noise_max - noise_min) * torch.rand(batch, slots, device=device, dtype=dtype)
     return torch.where(apply, sampled, sigma)
 
-def build_p61_streams_from_latents(z_all: torch.Tensor, sigma: torch.Tensor, target_view: int, front_condition_noise_prob: float=0.05, front_condition_noise_min: float=0.005, front_condition_noise_max: float=0.03, neighbor_condition_noise_prob: float=0.3, neighbor_condition_noise_min: float=0.02, neighbor_condition_noise_max: float=0.15, target_noise: torch.Tensor | None=None, front_noise: torch.Tensor | None=None, condition_noise: torch.Tensor | None=None) -> P61StreamBatch:
+def build_p61_streams_from_latents(z_all: torch.Tensor, sigma: torch.Tensor, target_view: int, front_condition_noise_prob: float=0.05, front_condition_noise_min: float=0.005, front_condition_noise_max: float=0.03, neighbor_condition_noise_prob: float=0.3, neighbor_condition_noise_min: float=0.02, neighbor_condition_noise_max: float=0.15, target_noise: torch.Tensor | None=None, front_noise: torch.Tensor | None=None, condition_noise: torch.Tensor | None=None, layout: P61GraphLayout | None=None) -> P61StreamBatch:
     if z_all.ndim != 6 or z_all.shape[1] != 6 or z_all.shape[2] != 16:
         raise ValueError(f'expected z_all shape (B,6,16,T,H,W), got {tuple(z_all.shape)}')
     batch = z_all.shape[0]
     if sigma.shape != (batch,):
         raise ValueError(f'expected sigma shape ({batch},), got {tuple(sigma.shape)}')
-    layout = p61_graph_layout(target_view, device=z_all.device)
+    # `layout` lets a caller inject an ablated topology (e.g. star / front-only).
+    # Without it this recomputes the proposed graph and silently overrides the
+    # caller's mask.
+    if layout is None:
+        layout = p61_graph_layout(target_view, device=z_all.device)
+    elif int(layout.target_view) != int(canonical_p61_target_view(target_view)):
+        raise ValueError(f'layout.target_view={int(layout.target_view)} does not match target_view={target_view}')
     target_clean = z_all[:, layout.target_view:layout.target_view + 1]
     if target_noise is None:
         target_noise = torch.randn_like(target_clean)

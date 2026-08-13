@@ -1,6 +1,7 @@
 from __future__ import annotations
 import argparse
 import json
+import shutil
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -19,7 +20,7 @@ from openlongtail.training.checkpoint_warp import load_warp_checkpoint, save_war
 from openlongtail.training.distributed import build_node_local_context, setup_distributed, wrap_ddp
 from openlongtail.training.forward_ray import RayTrainingComponents
 from openlongtail.training.forward_ray_p61 import P61_TARGET_VIEWS
-from openlongtail.training.forward_ray_warp import training_step_ray_warp
+from openlongtail.training.forward_ray_warp import GRAPH_MODES, REACTIVE_MODES, training_step_ray_warp
 from openlongtail.training.schedulers import FlowMatchScheduler
 from openlongtail.training.train_ray import HybridLRScheduler, total_steps_for_stage, trainable_params, use_node_broadcast_load
 from openlongtail.training.train_ray_p3 import enable_p3_static_graph_for_ddp
@@ -86,6 +87,33 @@ def build_warp_dataloader(config: TrainConfig, dataset: RayLatentCacheDatasetWar
     sampler = DistributedSampler(dataset, num_replicas=num_replicas, rank=rank) if distributed else None
     return DataLoader(dataset, batch_size=config.run.batch_size_per_gpu, sampler=sampler, shuffle=sampler is None, num_workers=config.data.num_workers, collate_fn=ray_latent_cache_collate_warp)
 
+def prune_checkpoints(output_dir: Path, keep_steps: set[int]) -> list[int]:
+    """Delete every step_* checkpoint except the given steps. Returns what was removed."""
+    removed: list[int] = []
+    for path in sorted(output_dir.glob('step_*')):
+        if not path.is_dir():
+            continue
+        try:
+            step = int(path.name[len('step_'):])
+        except ValueError:
+            continue
+        if step in keep_steps:
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        removed.append(step)
+    return removed
+
+def checkpoint_score(view_ema: dict[int, float]) -> float:
+    """Mean of the per-target-view loss EMAs.
+
+    Averaging per view first is what makes saves comparable: --target-view-sequence
+    cycles the target camera, so raw step loss mostly reflects which view came up,
+    and view 5 is additionally scaled by --rear-loss-weight.
+    """
+    if not view_ema:
+        return float('inf')
+    return sum(view_ema.values()) / len(view_ema)
+
 def build_dataset(config: TrainConfig, restrict_to_existing_sidecars: bool=False, require_lookback_sidecar: bool=False, index_filename: str='index.jsonl') -> RayLatentCacheDatasetWarp:
     if not config.latent_cache.use_latent_cache:
         raise ValueError('requires latent_cache.use_latent_cache=True (sidecar lives next to latent cache)')
@@ -94,7 +122,7 @@ def build_dataset(config: TrainConfig, restrict_to_existing_sidecars: bool=False
     data_cfg = RayLatentCacheDataConfig(latent_cache_root=config.latent_cache.latent_cache_root, text_emb_cache_root=config.data.text_emb_cache_root, cache_version=config.latent_cache.cache_version, cache_versions=config.latent_cache.cache_versions, text_drop_prob=config.data.text_drop_prob, max_items=config.data.max_items, index_filename=index_filename)
     return RayLatentCacheDatasetWarp(data_cfg, require_p4_sidecar=True, restrict_to_existing_sidecars=restrict_to_existing_sidecars, require_lookback_sidecar=require_lookback_sidecar)
 
-def run_training(config: TrainConfig, output_dir: Path, resume_from: Path | None=None, num_steps: int | None=None, device: str | None=None, wan21_vace_dir: Path | None=None, front_condition_noise_prob: float=P61_FRONT_CONDITION_NOISE_PROB, front_condition_noise_min: float=P61_FRONT_CONDITION_NOISE_MIN, front_condition_noise_max: float=P61_FRONT_CONDITION_NOISE_MAX, neighbor_condition_noise_prob: float=P61_NEIGHBOR_CONDITION_NOISE_PROB, neighbor_condition_noise_min: float=P61_NEIGHBOR_CONDITION_NOISE_MIN, neighbor_condition_noise_max: float=P61_NEIGHBOR_CONDITION_NOISE_MAX, sync_temporal_window: int=P61_SYNC_TEMPORAL_WINDOW, condition_encoder_layers: int=P61_CONDITION_ENCODER_LAYERS, semantic_queries: int=P61_SEMANTIC_QUERIES, enable_motion_embedding: bool=True, target_view_sequence: tuple[int, ...] | None=None, graph_gate_init_bias: float=GRAPH_GATE_INIT_BIAS, geo_head_dim: int=GEO_HEAD_DIM, geo_projection_temperature: float=GEO_PROJECTION_TEMPERATURE, rear_loss_weight: float=1.0, restrict_to_existing_sidecars: bool=False, require_lookback_sidecar: bool=False, index_filename: str='index.jsonl', unfreeze_backbone: bool=False, backbone_lr: float=1e-06) -> None:
+def run_training(config: TrainConfig, output_dir: Path, resume_from: Path | None=None, num_steps: int | None=None, device: str | None=None, wan21_vace_dir: Path | None=None, front_condition_noise_prob: float=P61_FRONT_CONDITION_NOISE_PROB, front_condition_noise_min: float=P61_FRONT_CONDITION_NOISE_MIN, front_condition_noise_max: float=P61_FRONT_CONDITION_NOISE_MAX, neighbor_condition_noise_prob: float=P61_NEIGHBOR_CONDITION_NOISE_PROB, neighbor_condition_noise_min: float=P61_NEIGHBOR_CONDITION_NOISE_MIN, neighbor_condition_noise_max: float=P61_NEIGHBOR_CONDITION_NOISE_MAX, sync_temporal_window: int=P61_SYNC_TEMPORAL_WINDOW, condition_encoder_layers: int=P61_CONDITION_ENCODER_LAYERS, semantic_queries: int=P61_SEMANTIC_QUERIES, enable_motion_embedding: bool=True, target_view_sequence: tuple[int, ...] | None=None, graph_gate_init_bias: float=GRAPH_GATE_INIT_BIAS, geo_head_dim: int=GEO_HEAD_DIM, geo_projection_temperature: float=GEO_PROJECTION_TEMPERATURE, rear_loss_weight: float=1.0, restrict_to_existing_sidecars: bool=False, require_lookback_sidecar: bool=False, index_filename: str='index.jsonl', unfreeze_backbone: bool=False, backbone_lr: float=1e-06, reactive_mode: str='warp', disable_plucker: bool=False, graph_mode: str='proposed', keep_only_latest_and_best: bool=False, fp32_gate: bool=False) -> None:
     context = setup_distributed(device)
     if unfreeze_backbone:
         config = replace(config, optim=replace(config.optim, lora_lr=backbone_lr))
@@ -102,6 +130,24 @@ def run_training(config: TrainConfig, output_dir: Path, resume_from: Path | None
     dataset = build_dataset(config, restrict_to_existing_sidecars=restrict_to_existing_sidecars, require_lookback_sidecar=require_lookback_sidecar, index_filename=index_filename)
     loader = build_warp_dataloader(config, dataset, distributed=context.is_distributed, num_replicas=context.world_size if context.is_distributed else None, rank=context.rank if context.is_distributed else None)
     dit = components.low_dit
+    if fp32_gate:
+        # fp32 master storage for the graph-memory sigma gates. Stored in bf16
+        # (the .to(bfloat16) in build_components) the gate can never train:
+        # Adam's per-step update (~2.1e-6) is 1/1827 of a bf16 ULP at |bias|=1.4,
+        # so every arm shipped with the gate frozen at its init -- the bug
+        # ray_wan's p30_sigma_gate.py exists to fix. fp32 storage alone is
+        # sufficient (updates become ~18 fp32 ULPs); the forward already upcasts
+        # sigma and downstream casts the gate output back to the query dtype.
+        gates = getattr(dit, 'graph_memory', None) or []
+        n_gate = 0
+        for _gm in gates:
+            _gm.gate.float()
+            n_gate += 1
+        if n_gate == 0:
+            raise RuntimeError('--fp32-gate: no graph_memory gates found to convert; the fix would be a silent no-op')
+        if context.rank == 0:
+            _dt = next(gates[0].gate.parameters()).dtype
+            print(f'[train] --fp32-gate: {n_gate} sigma gates ({type(gates[0].gate).__name__}) kept in {_dt}')
     new_params = trainable_params(components.shared_modules)
     if unfreeze_backbone:
         shared_param_ids = {id(p) for p in new_params}
@@ -118,6 +164,10 @@ def run_training(config: TrainConfig, output_dir: Path, resume_from: Path | None
     flow_scheduler = FlowMatchScheduler(shift=config.model.sigma_shift)
     output_dir.mkdir(parents=True, exist_ok=True)
     log_path = output_dir / config.run.train_log_name
+    view_ema: dict[int, float] = {}
+    ema_beta = 0.98
+    best_step: int | None = None
+    best_score = float('inf')
     iterator = iter(loader)
     start_step = 1
     if resume_from is not None:
@@ -126,6 +176,41 @@ def run_training(config: TrainConfig, output_dir: Path, resume_from: Path | None
             start_step = int(payload['metadata']['step']) + 1
             if context.rank == 0:
                 print(f'[train] resuming GLOBAL step counter at {start_step} (from {resume_from})')
+            # The step counter alone is not enough to make a resumed arm
+            # comparable with one that trained straight through:
+            #   * build_components() restores only the module weights, so Adam's
+            #     moments restart at zero and the first steps after a resume take
+            #     a different path than they would have;
+            #   * HybridLRScheduler is built fresh, so calling .step() once per
+            #     loop iteration walks the cosine from 0 while the loop counts
+            #     from start_step -- the run would finish at scheduler step
+            #     (total-start), never reaching the end of the schedule.
+            # Both are silent. For an ablation whose whole point is that arms
+            # differ in one component and nothing else, that is fatal, so restore
+            # the optimizer and fast-forward the schedule to where it left off.
+            if 'optimizer' in payload:
+                try:
+                    # P61HybridOptimizer is a plain wrapper around two AdamW
+                    # instances: it exposes state_dict() (which is how the
+                    # checkpoint was written) but no load_state_dict, so feed
+                    # each inner optimizer its own half.
+                    opt_state = payload['optimizer']
+                    if optimizer.new_optimizer is not None and opt_state.get('new_optimizer') is not None:
+                        optimizer.new_optimizer.load_state_dict(opt_state['new_optimizer'])
+                    optimizer.lora_optimizer.load_state_dict(opt_state['lora_optimizer'])
+                    if context.rank == 0:
+                        print(f'[train] restored optimizer state from {resume_from}')
+                except (ValueError, KeyError, RuntimeError, AttributeError) as exc:
+                    if context.rank == 0:
+                        print(f'[train] WARNING optimizer state not restored ({exc!r}); '
+                              f'this arm is NOT trajectory-comparable with an uninterrupted run')
+            elif context.rank == 0:
+                print('[train] WARNING no optimizer.pt in the checkpoint; Adam moments restart at zero')
+            for _ in range(start_step - 1):
+                lr_scheduler.step()
+            if context.rank == 0:
+                print(f'[train] fast-forwarded LR schedule by {start_step - 1} steps '
+                      f'(total_steps={total_steps})')
         except (FileNotFoundError, KeyError, ValueError) as exc:
             if context.rank == 0:
                 print(f'[train] could not read resume step (defaulting to 1): {exc!r}')
@@ -140,7 +225,7 @@ def run_training(config: TrainConfig, output_dir: Path, resume_from: Path | None
         target_view = None
         if target_view_sequence is not None:
             target_view = target_view_sequence[(step - 1) % len(target_view_sequence)]
-        result = training_step_ray_warp(batch, components, flow_scheduler, context.device, target_view=target_view, front_condition_noise_prob=front_condition_noise_prob, front_condition_noise_min=front_condition_noise_min, front_condition_noise_max=front_condition_noise_max, neighbor_condition_noise_prob=neighbor_condition_noise_prob, neighbor_condition_noise_min=neighbor_condition_noise_min, neighbor_condition_noise_max=neighbor_condition_noise_max, rear_loss_weight=rear_loss_weight)
+        result = training_step_ray_warp(batch, components, flow_scheduler, context.device, target_view=target_view, front_condition_noise_prob=front_condition_noise_prob, front_condition_noise_min=front_condition_noise_min, front_condition_noise_max=front_condition_noise_max, neighbor_condition_noise_prob=neighbor_condition_noise_prob, neighbor_condition_noise_min=neighbor_condition_noise_min, neighbor_condition_noise_max=neighbor_condition_noise_max, rear_loss_weight=rear_loss_weight, reactive_mode=reactive_mode, disable_plucker=disable_plucker, graph_mode=graph_mode)
         if not torch.isfinite(result.loss.detach()).all():
             raise RuntimeError(f'non-finite loss at step {step}: {result.loss.detach().float().item()}')
         result.loss.backward()
@@ -155,6 +240,10 @@ def run_training(config: TrainConfig, output_dir: Path, resume_from: Path | None
         optimizer.step()
         lr_scheduler.step()
         loss_mean_all_ranks = _mean_loss_for_logging_p61(result.loss)
+        # collective: must run on every rank, so it stays outside the rank-0 block
+        unweighted_all_ranks = _mean_loss_for_logging_p61(result.metrics['unweighted_loss'])
+        tv = int(result.metrics['target_view'])
+        view_ema[tv] = unweighted_all_ranks if tv not in view_ema else ema_beta * view_ema[tv] + (1.0 - ema_beta) * unweighted_all_ranks
         if context.device.type == 'cuda':
             torch.cuda.synchronize(context.device)
         step_time_sec = time.perf_counter() - step_start
@@ -164,15 +253,37 @@ def run_training(config: TrainConfig, output_dir: Path, resume_from: Path | None
                 ser['loss_mean_all_ranks'] = loss_mean_all_ranks
                 ser['grad_norm'] = float(grad_norm.detach().float().item())
                 ser['flow_shift'] = float(flow_scheduler.shift)
+                try:
+                    _gm = getattr(dit.module if hasattr(dit, 'module') else dit, 'graph_memory', None)
+                    if _gm is not None and len(_gm) > 0:
+                        import torch as _t
+                        _b = _t.stack([m.gate.net[-1].bias.detach().float().mean() for m in _gm])
+                        ser['graph_gate_bias_mean'] = float(_b.mean())
+                except (AttributeError, IndexError, TypeError):
+                    pass
                 ser['new_module_optimizer'] = 'torch.optim.AdamW'
                 ser['step'] = step
                 ser['step_time_sec'] = step_time_sec
+                ser['loss_ema_score'] = checkpoint_score(view_ema)
                 h.write(json.dumps(ser, sort_keys=True) + '\n')
             if step % config.run.save_every == 0 or step == total_steps:
                 if unfreeze_backbone:
                     save_warp_checkpoint_fulltune(components, optimizer, step, output_dir)
                 else:
                     save_warp_checkpoint(components, optimizer, step, output_dir)
+                if keep_only_latest_and_best:
+                    # `best` is chosen among saved steps only, so it always has a
+                    # checkpoint on disk to point at.
+                    score = checkpoint_score(view_ema)
+                    if len(view_ema) == len(target_view_sequence or (1, 2, 3, 4, 5)) and score < best_score:
+                        best_score = score
+                        best_step = step
+                    keep = {step} | ({best_step} if best_step is not None else set())
+                    removed = prune_checkpoints(output_dir, keep)
+                    (output_dir / 'checkpoint_index.json').write_text(json.dumps(
+                        {'latest_step': step, 'best_step': best_step, 'best_score': best_score,
+                         'score_metric': 'mean per-target-view EMA of unweighted flow loss',
+                         'ema_beta': ema_beta, 'pruned_steps': removed}, indent=1, sort_keys=True))
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
@@ -209,8 +320,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--max-items', type=int, default=None, help='Cap dataset to N clips (after sidecar filtering). For overfit experiments.')
     p.add_argument('--index-filename', type=str, default='index.jsonl', help='Index file name inside latent_cache_root. Use to point at a filtered training set (e.g. index_zzh_20260517_203414_min1m.jsonl) without overwriting the canonical index.')
     p.add_argument('--cross-view-blocks', type=str, default=None, help="Comma-separated block indices for cross-view / graph_memory insertion. Overrides config.model.cross_view_blocks. Use for 14B memory diagnostics, e.g. '19,39'.")
+    p.add_argument('--fp32-gate', action='store_true', help='Keep graph-memory SigmaGate params in float32 so Adam updates are representable (bf16 storage freezes the gate at init).')
     p.add_argument('--unfreeze-backbone', action='store_true', help="FULLTUNE mode: do NOT inject LoRA and do NOT freeze the Wan2.1-VACE backbone. Train all backbone params at --backbone-lr alongside the new shared modules. Ckpt format becomes 'vace_fulltune' (backbone.pt + shared_modules.pt). 1.3B fits H200; 14B needs FSDP.")
     p.add_argument('--backbone-lr', type=float, default=1e-06, help='LR for the unfrozen backbone in --unfreeze-backbone mode. Defaults to 1e-6 (10x smaller than typical lora_lr=1e-5).')
+    p.add_argument('--reactive-mode', choices=REACTIVE_MODES, default='warp', help="ABLATION. 'warp' puts the reprojected target latent in the VACE reactive slot; 'naive' puts the front latent in verbatim with visibility 1. Both keep the VACE pathway equally populated, so the delta isolates the reprojection geometry.")
+    p.add_argument('--disable-plucker', action='store_true', help='ABLATION. Zero the Plucker rays, relative-pose and target-pose features. View identity embeddings are kept, so the model still knows which camera to render.')
+    p.add_argument('--graph-mode', choices=GRAPH_MODES, default='proposed', help="ABLATION. 'proposed' uses G(3)={0,1}, G(4)={0,2}, G(5)={0,3,4}; 'star' restricts every target to G(i)={0}. Identical parameter count either way, so the delta isolates the graph topology.")
+    p.add_argument('--keep-only-latest-and-best', action='store_true', help='Retain just two checkpoints: the most recent save and the best-scoring one (mean per-target-view EMA of the unweighted flow loss). Writes checkpoint_index.json.')
     return p.parse_args()
 
 def main() -> None:
@@ -231,6 +347,6 @@ def main() -> None:
     if args.cross_view_blocks is not None:
         cvb = tuple((int(s) for s in args.cross_view_blocks.split(',') if s.strip()))
         config = replace(config, model=replace(config.model, cross_view_blocks=cvb))
-    run_training(config, args.output_dir, resume_from=args.resume_from, num_steps=args.num_steps, device=args.device, wan21_vace_dir=args.wan21_vace_dir, front_condition_noise_prob=args.front_condition_noise_prob, front_condition_noise_min=args.front_condition_noise_min, front_condition_noise_max=args.front_condition_noise_max, neighbor_condition_noise_prob=args.neighbor_condition_noise_prob, neighbor_condition_noise_min=args.neighbor_condition_noise_min, neighbor_condition_noise_max=args.neighbor_condition_noise_max, sync_temporal_window=args.sync_temporal_window, condition_encoder_layers=args.condition_encoder_layers, semantic_queries=args.semantic_queries, enable_motion_embedding=not args.disable_motion_embedding, target_view_sequence=parse_target_view_sequence(args.target_view_sequence), graph_gate_init_bias=args.graph_gate_init_bias, geo_head_dim=args.geo_head_dim, geo_projection_temperature=args.geo_projection_temperature, rear_loss_weight=args.rear_loss_weight, restrict_to_existing_sidecars=args.restrict_to_existing_sidecars, require_lookback_sidecar=args.require_lookback_sidecar, index_filename=args.index_filename, unfreeze_backbone=args.unfreeze_backbone, backbone_lr=args.backbone_lr)
+    run_training(config, args.output_dir, resume_from=args.resume_from, num_steps=args.num_steps, device=args.device, wan21_vace_dir=args.wan21_vace_dir, front_condition_noise_prob=args.front_condition_noise_prob, front_condition_noise_min=args.front_condition_noise_min, front_condition_noise_max=args.front_condition_noise_max, neighbor_condition_noise_prob=args.neighbor_condition_noise_prob, neighbor_condition_noise_min=args.neighbor_condition_noise_min, neighbor_condition_noise_max=args.neighbor_condition_noise_max, sync_temporal_window=args.sync_temporal_window, condition_encoder_layers=args.condition_encoder_layers, semantic_queries=args.semantic_queries, enable_motion_embedding=not args.disable_motion_embedding, target_view_sequence=parse_target_view_sequence(args.target_view_sequence), graph_gate_init_bias=args.graph_gate_init_bias, geo_head_dim=args.geo_head_dim, geo_projection_temperature=args.geo_projection_temperature, rear_loss_weight=args.rear_loss_weight, restrict_to_existing_sidecars=args.restrict_to_existing_sidecars, require_lookback_sidecar=args.require_lookback_sidecar, index_filename=args.index_filename, unfreeze_backbone=args.unfreeze_backbone, backbone_lr=args.backbone_lr, reactive_mode=args.reactive_mode, disable_plucker=args.disable_plucker, graph_mode=args.graph_mode, keep_only_latest_and_best=args.keep_only_latest_and_best, fp32_gate=args.fp32_gate)
 if __name__ == '__main__':
     main()

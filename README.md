@@ -16,21 +16,24 @@ Texas A&M University · NVIDIA · University of Wisconsin–Madison · UT Austin
 
 <a href="https://arxiv.org/abs/2607.09655"><img src="https://img.shields.io/badge/arXiv-2607.09655-b31b1b?logo=arxiv&logoColor=white"></a>
 <a href="https://openlongtail.github.io/"><img src="https://img.shields.io/badge/Project%20Page-OpenLongTail-1f8acb?logo=googlechrome&logoColor=white"></a>
+<a href="https://huggingface.co/luuuulinnnn/openlongtail-ckpt"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Weights-openlongtail--ckpt-ffd21e"></a>
 <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow"></a>
 
 </div>
 
 > **TL;DR** — From a single <u>front-camera</u> driving video, **OpenLongTail** synthesizes the <u>five missing rig cameras</u> at the <u>same timestamps</u> — turning monocular long-tail clips into **pose-grounded, multi-view training data** for **robust VLA driving policies**.
 
-## TODO
+## Release
 
-- [ ] **Checkpoint** — *will be released in July 2026*
+- [x] **Checkpoint**
+- [x] **Demo**
 - [x] **Inference code**
 - [x] **Preprocessing & training code**
 
 ## Table of Contents
 
 - [Installation](#installation)
+- [Demo](#demo)
 - [Inference](#inference)
 - [Building Training Data](#building-training-data)
 - [Training](#training)
@@ -40,22 +43,38 @@ Texas A&M University · NVIDIA · University of Wisconsin–Madison · UT Austin
 
 ```bash
 # 1. Clone
-git clone https://github.com/lulinliu/longt.git openlongtail
-cd openlongtail
+git clone https://github.com/phai-lab/OpenLongTail.git
+cd OpenLongTail
 
-# 2. Create the environment (Python 3.10, CUDA, bf16)
-conda create -n openlongtail python=3.10 -y
+# 2. Create the environment (Python 3.11, CUDA 12.8, bf16)
+conda create -n openlongtail python=3.11 -y
 conda activate openlongtail
 
 # 3. Install a CUDA-matched PyTorch, then the rest of the deps
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
 pip install -r requirements.txt
 ```
 
-Download the **base backbone** and the **OpenLongTail checkpoint** from Hugging Face in one step:
+Download the **base backbone**, the **OpenLongTail checkpoint**, and the **demo data** from Hugging Face in one step:
 
 ```bash
 bash scripts/download.sh
+```
+
+## Demo
+
+Generate the 5 surround views for the bundled demo clips and build a PRED-vs-GT comparison gallery:
+
+```bash
+bash scripts/demo.sh                  # single GPU
+bash scripts/demo.sh --gpus 0,1,2     # shard clips across GPUs
+open demo/outputs/gallery/index.html
+```
+
+Or run end-to-end on your own front-camera video (depth and ego-pose are estimated automatically):
+
+```bash
+bash scripts/demo.sh --raw path/to/my_front.mp4
 ```
 
 ## Inference
@@ -123,11 +142,11 @@ OpenLongTail builds on the following open-source projects:
 
 - [Wan2.1-VACE](https://github.com/Wan-Video/Wan2.1) for the video-diffusion backbone.
 - [DepthCrafter](https://github.com/Tencent/DepthCrafter) for video-coherent depth used by the depth warp.
-- [MapAnything](https://github.com/facebookresearch/map-anything) for metric camera-pose recovery on in-the-wild clips.
+- [MapAnything](https://github.com/facebookresearch/map-anything) for camera-pose recovery on in-the-wild clips.
 - [Qwen2.5-VL](https://github.com/QwenLM/Qwen2.5-VL) for front-view scene captioning.
 
-We thank the authors of these projects for releasing their code and models. Please refer to the corresponding files under `third_party/` for upstream licenses and notices.
+We thank the authors of these projects for releasing their code and models.
 
 ## License
 
-Released under the [MIT License](LICENSE); base models remain under their respective licenses.
+Released under the [MIT License](LICENSE); the released weights are Apache-2.0, and base models remain under their respective licenses.

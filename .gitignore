@@ -9,6 +9,7 @@ venv/
 # Model assets / caches / outputs (never commit weights or data)
 checkpoints/
 outputs/
+demo/
 *.pt
 *.pth
 *.safetensors
@@ -27,3 +28,4 @@ _*
 .vscode/
 .idea/
 .DS_Store
+*.swp

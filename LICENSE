@@ -20,5 +20,12 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-Base models (Wan2.1-VACE, DepthCrafter, MapAnything, Qwen2.5-VL) remain under
-their respective licenses.
+---
+
+NOTE ON MODEL WEIGHTS AND THIRD-PARTY COMPONENTS
+
+This MIT license covers the code in this repository only. The released model
+weights (OpenLongTail WM 1.3B ckpt) are distributed under Apache-2.0.
+The Wan2.1-VACE-1.3B backbone, DepthCrafter, DepthAnythingV2, MapAnything, and Qwen2.5-VL are
+governed by their own upstream licenses; review them before redistribution or
+commercial use.

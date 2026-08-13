@@ -1,8 +1,19 @@
 from __future__ import annotations
+import os
 from pathlib import Path
 from typing import Any
 import torch
 from openlongtail.data.latent_cache_dataset import RayLatentCacheDataset, ray_latent_cache_collate
+
+# The release renamed the warp sidecars (clip_*_p65.pt -> clip_*_warp.pt,
+# clip_*_p65adj.pt -> clip_*_lookback.pt). Caches built before that rename hold
+# byte-identical tensors under the identical keys and only differ in filename, so
+# the suffix is configurable rather than requiring the cache to be rewritten.
+WARP_SIDECAR_SUFFIX = os.environ.get('OPENLONGTAIL_WARP_SIDECAR_SUFFIX', '_warp')
+LOOKBACK_SIDECAR_SUFFIX = os.environ.get('OPENLONGTAIL_LOOKBACK_SIDECAR_SUFFIX', '_lookback')
+
+def _with_suffix(cache_path: Path, suffix: str) -> Path:
+    return cache_path.with_name(f'{cache_path.stem}{suffix}{cache_path.suffix}')
 
 class RayLatentCacheDatasetWarp(RayLatentCacheDataset):
 
@@ -14,11 +25,11 @@ class RayLatentCacheDatasetWarp(RayLatentCacheDataset):
             for entry in self.entries:
                 rel = Path(entry['path'])
                 cache_path = config.latent_cache_root / rel
-                v0 = cache_path.with_name(f'{cache_path.stem}_warp{cache_path.suffix}')
+                v0 = _with_suffix(cache_path, WARP_SIDECAR_SUFFIX)
                 if not v0.exists():
                     continue
                 if self.require_lookback_sidecar:
-                    v1 = cache_path.with_name(f'{cache_path.stem}_lookback{cache_path.suffix}')
+                    v1 = _with_suffix(cache_path, LOOKBACK_SIDECAR_SUFFIX)
                     if not v1.exists():
                         continue
                 kept.append(entry)
@@ -26,19 +37,20 @@ class RayLatentCacheDatasetWarp(RayLatentCacheDataset):
                 raise FileNotFoundError(f'restrict_to_existing_sidecars=True but no usable sidecars found under {config.latent_cache_root}')
             self.entries = kept
 
-    def _sidecar_path(self, idx: int) -> Path:
+    # NOT named _sidecar_path: the parent resolves the P4 *pose* sidecar through
+    # a method of that name, so overriding it made the parent load the warp
+    # sidecar and reject it for not containing only T_anchor_front.
+    def _warp_sidecar_path(self, idx: int) -> Path:
         rel_path = Path(self.entries[idx]['path'])
-        cache_path = self.config.latent_cache_root / rel_path
-        return cache_path.with_name(f'{cache_path.stem}_warp{cache_path.suffix}')
+        return _with_suffix(self.config.latent_cache_root / rel_path, WARP_SIDECAR_SUFFIX)
 
     def _adj_sidecar_path(self, idx: int) -> Path:
         rel_path = Path(self.entries[idx]['path'])
-        cache_path = self.config.latent_cache_root / rel_path
-        return cache_path.with_name(f'{cache_path.stem}_lookback{cache_path.suffix}')
+        return _with_suffix(self.config.latent_cache_root / rel_path, LOOKBACK_SIDECAR_SUFFIX)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         item = super().__getitem__(idx)
-        sidecar_path = self._sidecar_path(idx)
+        sidecar_path = self._warp_sidecar_path(idx)
         if not sidecar_path.exists():
             raise FileNotFoundError(f'warp sidecar missing: {sidecar_path}')
         sidecar = torch.load(sidecar_path, map_location='cpu', weights_only=True)

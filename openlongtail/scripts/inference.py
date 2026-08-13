@@ -67,6 +67,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--reference-cache', type=Path, default=None)
     p.add_argument('--caption-cache', type=Path, default=None, help='dir with per_uuid/<uuid>.txt one-sentence captions (Qwen-derived); UMT5-encoded here as the cond text so CFG engages')
     p.add_argument('--caption', type=str, default=None, help='override caption applied to ALL clips (instead of --caption-cache)')
+    p.add_argument('--text-emb-cache', type=Path, default=None, help='dir with per_uuid/<uuid>.pt PRE-ENCODED UMT5 text embeddings (text_emb/text_mask). When set, the cond text embedding is loaded verbatim from here (bypassing Qwen + runtime UMT5) so the text condition is IDENTICAL to the cached tier — for a geometry-only controlled comparison. Overrides --caption-cache/--caption for the embedding; the txt caption (if any) is still recorded for logging.')
     p.add_argument('--cross-guide', type=float, default=3.5)
     p.add_argument('--rear-guide', type=float, default=7.0)
     p.add_argument('--num-steps', type=int, default=50)
@@ -80,6 +81,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--device', type=str, default='cuda')
     p.add_argument('--overwrite', action='store_true')
     p.add_argument('--treat-as-nv', action='store_true', help='override K/E with the PAI reference rig; required for cross-camera dashcam sources (Nexar/Waymo). Matches the baseline dashcam harness.')
+    p.add_argument('--nusc-calib', action='store_true', help='load per-clip nusc_calib.pt (real nuScenes 6-cam K/E, camera->ego) as (k_all,e_all); generate side/rear at nuScenes poses. Discrete cam_id slot stays NV via natural slot mapping. Overrides --treat-as-nv.')
     return p.parse_args()
 
 def main() -> None:
@@ -113,7 +115,14 @@ def main() -> None:
         print(f'[{idx}/{len(clips)}] {rel_key} warp=live', flush=True)
         (front, depth, pose, k_front, meta) = _load_clip_tensors(clip_dir)
         uuid = str(meta.get('uuid', ''))
-        if args.treat_as_nv:
+        if args.nusc_calib:
+            calib_path = clip_dir / 'nusc_calib.pt'
+            calib = torch.load(calib_path, map_location='cpu', weights_only=False)
+            k_all = calib['K_all'].float()
+            e_all = calib['E_all'].float()
+            assert tuple(k_all.shape) == (6, 3, 3) and tuple(e_all.shape) == (6, 4, 4), f'bad nusc_calib shapes {k_all.shape} {e_all.shape}'
+            print(f'  [nusc-calib] loaded real nuScenes 6-cam K/E from {calib_path.name}; front fx={float(k_all[0, 0, 0]):.0f}', flush=True)
+        elif args.treat_as_nv:
             k_all = reference_k.clone()
             e_all = reference_e.clone()
         else:
@@ -123,7 +132,20 @@ def main() -> None:
         pose = pose.to(device)
         (warp_provider, warp_summary) = build_live_warp_provider(front, depth, k_all, e_all, pose, vae, device, splat_radius=args.splat_radius)
         (caption, cap_src) = _resolve_caption(args.caption_cache, uuid, args.caption)
-        if caption:
+        emb_pt = (args.text_emb_cache / 'per_uuid' / f'{uuid}.pt') if args.text_emb_cache is not None else None
+        if emb_pt is not None and emb_pt.exists():
+            # Controlled comparison: use the cached tier's PRE-ENCODED UMT5
+            # embedding verbatim, so the text condition is bit-identical to
+            # inference_cached and the only variable left is the geometry
+            # (live DepthCrafter depth + MapAnything pose vs the cached warp).
+            pkg = torch.load(emb_pt, map_location='cpu', weights_only=False)
+            cap_emb = pkg.get('text_emb', pkg.get('emb'))
+            cap_mask = pkg.get('text_mask', pkg.get('mask', pkg.get('attention_mask')))
+            if cap_emb is None or cap_mask is None:
+                raise KeyError(f'{emb_pt} missing text_emb/text_mask (keys={list(pkg.keys())})')
+            cap_src = f'text-emb-cache({emb_pt.name})'
+            text_encoder = CachedTextEncoder(text_emb=cap_emb.unsqueeze(0).to(device=device, dtype=torch.bfloat16), text_mask=cap_mask.unsqueeze(0).to(device=device), null_emb=null_e, null_mask=null_m)
+        elif caption:
             (cap_emb, cap_mask) = caption_encoder.encode(caption)
             text_encoder = CachedTextEncoder(text_emb=cap_emb.unsqueeze(0).to(device=device, dtype=torch.bfloat16), text_mask=cap_mask.unsqueeze(0).to(device=device), null_emb=null_e, null_mask=null_m)
         else:
@@ -153,7 +175,7 @@ def main() -> None:
             outputs['pred'][str(vid)] = _write_mp4(clip_out / f'pred_{VIEW_NAMES[vid]}.mp4', pred_tchw[li], fps)
             rows.append(pred_tchw[li])
         outputs['pred_grid'] = _write_mp4(clip_out / 'pred_grid.mp4', torch.cat(rows, dim=-1), fps)
-        cfg_active = bool(caption) and (not torch.equal(text_encoder.text_emb.float(), text_encoder.null_emb.float()))
+        cfg_active = not torch.equal(text_encoder.text_emb.float(), text_encoder.null_emb.float())
         rear_cov = {str(v): float(warp_summary.get(str(v), {}).get('merged_vis_lat_pct', 0.0)) for v in REAR_VIEWS}
         clip_summary = {'clip': str(rel_key), 'status': 'ok', 'elapsed_sec': time.time() - started, 'uuid': uuid, 'caption': caption, 'caption_source': cap_src, 'cfg_active': cfg_active, 'cross_guide': args.cross_guide, 'rear_guide': args.rear_guide, 'rear_merged_vis_lat_pct': rear_cov, 'warp_summary': warp_summary, 'outputs': outputs}
         done_path.write_text(json.dumps(_jsonable(clip_summary), indent=2, sort_keys=True))
